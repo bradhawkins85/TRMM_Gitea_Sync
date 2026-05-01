@@ -180,7 +180,7 @@ def get_all_trmm_scripts() -> Dict[Tuple[str, str], dict]:
     resp = _trmm_get("/scripts/")
     try:
         data = resp.json()
-    except requests.exceptions.JSONDecodeError as exc:
+    except (requests.exceptions.JSONDecodeError, ValueError) as exc:
         raise RuntimeError(
             f"TRMM /scripts/ returned non-JSON response "
             f"(status {resp.status_code}): {exc}"
@@ -195,7 +195,13 @@ def get_all_trmm_scripts() -> Dict[Tuple[str, str], dict]:
 
     index: Dict[Tuple[str, str], dict] = {}
     for script in data:
-        key = (script["name"], script.get("category") or "")
+        name = script.get("name")
+        if not name:
+            log.warning(
+                "Skipping TRMM script with missing name (id=%s)", script.get("id")
+            )
+            continue
+        key = (name, script.get("category") or "")
         index[key] = script
     return index
 
