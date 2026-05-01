@@ -122,9 +122,15 @@ def get_gitea_file_content(path: str) -> str:
     """Return the decoded text content of a file in the configured repo."""
     api_path = f"/repos/{GITEA_OWNER}/{GITEA_REPO}/contents/{path}"
     data = _gitea_get(api_path, {"ref": GITEA_BRANCH}).json()
-    # Gitea encodes file content as base64; strip embedded newlines before decoding
+    # Gitea encodes file content as base64; strip embedded newlines before decoding.
+    # Use "utf-8-sig" so that a UTF-8 BOM (common in Windows-authored PowerShell
+    # files) is silently stripped rather than included in the script body.
     encoded = data["content"].replace("\n", "")
-    return base64.b64decode(encoded).decode("utf-8")
+    raw = base64.b64decode(encoded)
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return raw.decode("latin-1")
 
 
 # ---------------------------------------------------------------------------
@@ -436,11 +442,18 @@ def main() -> None:
             else:
                 updated += 1
         except requests.HTTPError as exc:
+            response_detail = ""
+            if exc.response is not None:
+                try:
+                    response_detail = f"  Response body: {exc.response.text}"
+                except Exception:  # pylint: disable=broad-except
+                    pass
             log.error(
-                "HTTP error syncing '%s' [%s]: %s",
+                "HTTP error syncing '%s' [%s]: %s%s",
                 gs["name"],
                 gs["category"],
                 exc,
+                response_detail,
             )
             errors += 1
         except Exception as exc:  # pylint: disable=broad-except
