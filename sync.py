@@ -24,6 +24,10 @@ GITEA_TOKEN    Gitea access token (required for private repos)
 GITEA_OWNER    Gitea repository owner (user or org)
 GITEA_REPO     Gitea repository name
 GITEA_BRANCH   Branch to read from (default: main)
+IGNORE_SSL     Set to "true", "1", or "yes" to disable SSL certificate
+               verification for all API calls.  Useful when the script runs
+               on the TRMM server itself where the API hostname resolves to
+               127.0.0.1 and the certificate CN does not match (default: false)
 """
 
 import base64
@@ -33,6 +37,7 @@ import sys
 from typing import Dict, List, Optional, Tuple
 
 import requests
+import urllib3
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -56,6 +61,12 @@ GITEA_TOKEN: str = os.environ.get("GITEA_TOKEN", "")
 GITEA_OWNER: str = os.environ.get("GITEA_OWNER", "")
 GITEA_REPO: str = os.environ.get("GITEA_REPO", "")
 GITEA_BRANCH: str = os.environ.get("GITEA_BRANCH", "main")
+
+IGNORE_SSL: bool = os.environ.get("IGNORE_SSL", "").lower() in ("1", "true", "yes")
+SSL_VERIFY: bool = not IGNORE_SSL
+
+if IGNORE_SSL:
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -93,7 +104,7 @@ def _gitea_headers() -> Dict[str, str]:
 def _gitea_get(path: str, params: Optional[Dict] = None) -> requests.Response:
     url = f"{GITEA_URL}/api/v1{path}"
     try:
-        resp = requests.get(url, headers=_gitea_headers(), params=params or {}, timeout=30)
+        resp = requests.get(url, headers=_gitea_headers(), params=params or {}, timeout=30, verify=SSL_VERIFY)
     except requests.exceptions.RequestException as exc:
         log.error("Network error contacting Gitea (%s): %s", url, exc)
         raise
@@ -131,7 +142,7 @@ def _trmm_headers() -> Dict[str, str]:
 def _trmm_get(path: str) -> requests.Response:
     url = f"{TRMM_API_URL}{path}"
     try:
-        resp = requests.get(url, headers=_trmm_headers(), timeout=30)
+        resp = requests.get(url, headers=_trmm_headers(), timeout=30, verify=SSL_VERIFY)
     except requests.exceptions.RequestException as exc:
         log.error("Network error contacting TRMM (%s): %s", url, exc)
         raise
@@ -142,7 +153,7 @@ def _trmm_get(path: str) -> requests.Response:
 def _trmm_post(path: str, data: dict) -> requests.Response:
     url = f"{TRMM_API_URL}{path}"
     try:
-        resp = requests.post(url, headers=_trmm_headers(), json=data, timeout=30)
+        resp = requests.post(url, headers=_trmm_headers(), json=data, timeout=30, verify=SSL_VERIFY)
     except requests.exceptions.RequestException as exc:
         log.error("Network error contacting TRMM (%s): %s", url, exc)
         raise
@@ -153,7 +164,7 @@ def _trmm_post(path: str, data: dict) -> requests.Response:
 def _trmm_put(path: str, data: dict) -> requests.Response:
     url = f"{TRMM_API_URL}{path}"
     try:
-        resp = requests.put(url, headers=_trmm_headers(), json=data, timeout=30)
+        resp = requests.put(url, headers=_trmm_headers(), json=data, timeout=30, verify=SSL_VERIFY)
     except requests.exceptions.RequestException as exc:
         log.error("Network error contacting TRMM (%s): %s", url, exc)
         raise
@@ -382,6 +393,8 @@ def main() -> None:
         sys.exit(1)
 
     log.info("TRMM-Gitea sync starting")
+    if IGNORE_SSL:
+        log.warning("SSL certificate verification is DISABLED (IGNORE_SSL=true)")
     log.info(
         "Gitea : %s  owner=%s  repo=%s  branch=%s",
         GITEA_URL,
