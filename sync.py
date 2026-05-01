@@ -92,7 +92,11 @@ def _gitea_headers() -> Dict[str, str]:
 
 def _gitea_get(path: str, params: Optional[Dict] = None) -> requests.Response:
     url = f"{GITEA_URL}/api/v1{path}"
-    resp = requests.get(url, headers=_gitea_headers(), params=params or {}, timeout=30)
+    try:
+        resp = requests.get(url, headers=_gitea_headers(), params=params or {}, timeout=30)
+    except requests.exceptions.RequestException as exc:
+        log.error("Network error contacting Gitea (%s): %s", url, exc)
+        raise
     resp.raise_for_status()
     return resp
 
@@ -126,21 +130,33 @@ def _trmm_headers() -> Dict[str, str]:
 
 def _trmm_get(path: str) -> requests.Response:
     url = f"{TRMM_API_URL}{path}"
-    resp = requests.get(url, headers=_trmm_headers(), timeout=30)
+    try:
+        resp = requests.get(url, headers=_trmm_headers(), timeout=30)
+    except requests.exceptions.RequestException as exc:
+        log.error("Network error contacting TRMM (%s): %s", url, exc)
+        raise
     resp.raise_for_status()
     return resp
 
 
 def _trmm_post(path: str, data: dict) -> requests.Response:
     url = f"{TRMM_API_URL}{path}"
-    resp = requests.post(url, headers=_trmm_headers(), json=data, timeout=30)
+    try:
+        resp = requests.post(url, headers=_trmm_headers(), json=data, timeout=30)
+    except requests.exceptions.RequestException as exc:
+        log.error("Network error contacting TRMM (%s): %s", url, exc)
+        raise
     resp.raise_for_status()
     return resp
 
 
 def _trmm_put(path: str, data: dict) -> requests.Response:
     url = f"{TRMM_API_URL}{path}"
-    resp = requests.put(url, headers=_trmm_headers(), json=data, timeout=30)
+    try:
+        resp = requests.put(url, headers=_trmm_headers(), json=data, timeout=30)
+    except requests.exceptions.RequestException as exc:
+        log.error("Network error contacting TRMM (%s): %s", url, exc)
+        raise
     resp.raise_for_status()
     return resp
 
@@ -150,9 +166,24 @@ def get_all_trmm_scripts() -> Dict[Tuple[str, str], dict]:
     Return a dict mapping (name, category) → script metadata for every
     script currently in TRMM.
     """
-    scripts: List[dict] = _trmm_get("/api/v3/scripts/").json()
+    resp = _trmm_get("/api/v3/scripts/")
+    try:
+        data = resp.json()
+    except requests.exceptions.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"TRMM /api/v3/scripts/ returned non-JSON response "
+            f"(status {resp.status_code}): {exc}"
+        ) from exc
+
+    if not isinstance(data, list):
+        raise RuntimeError(
+            f"TRMM /api/v3/scripts/ returned unexpected response type "
+            f"{type(data).__name__!r} – expected a list. "
+            f"Response: {str(data)[:200]}"
+        )
+
     index: Dict[Tuple[str, str], dict] = {}
-    for script in scripts:
+    for script in data:
         key = (script["name"], script.get("category") or "")
         index[key] = script
     return index
@@ -361,11 +392,19 @@ def main() -> None:
     log.info("TRMM  : %s", TRMM_API_URL)
 
     log.info("Fetching scripts from TRMM …")
-    trmm_index = get_all_trmm_scripts()
+    try:
+        trmm_index = get_all_trmm_scripts()
+    except (requests.exceptions.RequestException, RuntimeError) as exc:
+        log.error("Failed to fetch scripts from TRMM: %s", exc)
+        sys.exit(1)
     log.info("  %d script(s) found in TRMM", len(trmm_index))
 
     log.info("Fetching scripts from Gitea …")
-    gitea_scripts = collect_gitea_scripts()
+    try:
+        gitea_scripts = collect_gitea_scripts()
+    except requests.exceptions.RequestException as exc:
+        log.error("Failed to fetch scripts from Gitea: %s", exc)
+        sys.exit(1)
     log.info("  %d script(s) found in Gitea", len(gitea_scripts))
 
     created = updated = errors = 0
