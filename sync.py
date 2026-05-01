@@ -177,18 +177,18 @@ def get_all_trmm_scripts() -> Dict[Tuple[str, str], dict]:
     Return a dict mapping (name, category) → script metadata for every
     script currently in TRMM.
     """
-    resp = _trmm_get("/api/v3/scripts/")
+    resp = _trmm_get("/scripts/")
     try:
         data = resp.json()
     except requests.exceptions.JSONDecodeError as exc:
         raise RuntimeError(
-            f"TRMM /api/v3/scripts/ returned non-JSON response "
+            f"TRMM /scripts/ returned non-JSON response "
             f"(status {resp.status_code}): {exc}"
         ) from exc
 
     if not isinstance(data, list):
         raise RuntimeError(
-            f"TRMM /api/v3/scripts/ returned unexpected response type "
+            f"TRMM /scripts/ returned unexpected response type "
             f"{type(data).__name__!r} – expected a list. "
             f"Response: {str(data)[:200]}"
         )
@@ -331,7 +331,7 @@ def sync_script(gitea_script: dict, trmm_index: Dict[Tuple[str, str], dict]) -> 
             "run_as_user": existing.get("run_as_user", False),
             "env_vars": existing.get("env_vars") or [],
         }
-        _trmm_put(f"/api/v3/scripts/{script_id}/", payload)
+        _trmm_put(f"/scripts/{script_id}/", payload)
         log.info("Updated  : %s [category=%s]", name, category)
         return "updated"
 
@@ -351,7 +351,7 @@ def sync_script(gitea_script: dict, trmm_index: Dict[Tuple[str, str], dict]) -> 
         "run_as_user": False,
         "env_vars": [],
     }
-    _trmm_post("/api/v3/scripts/", payload)
+    _trmm_post("/scripts/", payload)
     log.info("Created  : %s [category=%s]", name, category)
     return "created"
 
