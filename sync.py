@@ -77,8 +77,8 @@ EXTENSION_TO_SHELL: Dict[str, str] = {
     ".ps1": "powershell",
     ".py": "python",
     ".sh": "shell",
-    ".bat": "batch",
-    ".cmd": "batch",
+    ".bat": "cmd",
+    ".cmd": "cmd",
 }
 
 # Default supported_platforms for newly created scripts, keyed by shell type
@@ -86,7 +86,7 @@ DEFAULT_PLATFORMS: Dict[str, List[str]] = {
     "powershell": ["windows"],
     "python": ["windows", "linux", "darwin"],
     "shell": ["linux", "darwin"],
-    "batch": ["windows"],
+    "cmd": ["windows"],
 }
 
 DEFAULT_SCRIPT_TYPE: str = "userdefined"
