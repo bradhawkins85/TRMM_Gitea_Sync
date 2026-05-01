@@ -65,6 +65,7 @@ All configuration is supplied via **environment variables**.
 | `GITEA_OWNER`  | ✅       | Gitea repository owner (user or organisation name)           |
 | `GITEA_REPO`   | ✅       | Gitea repository name                                        |
 | `GITEA_BRANCH` | ❌       | Branch to sync from (default: `main`)                        |
+| `IGNORE_SSL`   | ❌       | Set to `true`, `1`, or `yes` to disable SSL certificate verification for all API calls. Useful when running on the TRMM server where the API hostname resolves to `127.0.0.1` and the TLS certificate CN does not match (default: `false`) |
 
 ---
 
