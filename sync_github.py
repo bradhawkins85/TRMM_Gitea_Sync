@@ -212,6 +212,12 @@ def _trmm_delete(path: str) -> requests.Response:
     return resp
 
 
+def get_trmm_script_detail(script_id: int) -> dict:
+    """Return full metadata for a single TRMM script, including ``script_body``."""
+    resp = _trmm_get(f"/scripts/{script_id}/")
+    return resp.json()
+
+
 def get_all_trmm_scripts() -> Dict[Tuple[str, str], dict]:
     """
     Return a dict mapping (name, category) → script metadata for every
@@ -360,6 +366,12 @@ def sync_script(github_script: dict, trmm_index: Dict[Tuple[str, str], dict]) ->
         existing = trmm_index[key]
         script_id: int = existing["id"]
 
+        # The TRMM list endpoint (/scripts/) omits script_body for performance.
+        # Fetch the full script detail so we can compare bodies accurately and
+        # update the cache so any subsequent reference to this entry is complete.
+        if "script_body" not in existing:
+            existing = get_trmm_script_detail(script_id)
+            trmm_index[key] = existing
         existing_body: str = existing.get("script_body") or ""
         existing_description: str = existing.get("description") or ""
         new_description: str = _github_description(existing_description)
