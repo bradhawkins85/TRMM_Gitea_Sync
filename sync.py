@@ -138,9 +138,13 @@ def get_gitea_file_content(path: str) -> str:
     encoded = data["content"].replace("\n", "")
     raw = base64.b64decode(encoded)
     try:
-        return raw.decode("utf-8-sig")
+        text = raw.decode("utf-8-sig")
     except UnicodeDecodeError:
-        return raw.decode("latin-1")
+        text = raw.decode("latin-1")
+    # Normalize Windows-style line endings so that the body compared against
+    # what TRMM stores uses a consistent line-ending style, preventing spurious
+    # updates on every sync run when scripts contain \r\n.
+    return text.replace("\r\n", "\n")
 
 
 # ---------------------------------------------------------------------------
