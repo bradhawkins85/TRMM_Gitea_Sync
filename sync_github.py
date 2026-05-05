@@ -342,7 +342,9 @@ def sync_script(github_script: dict, trmm_index: Dict[Tuple[str, str], dict]) ->
     """
     Create or update a single TRMM script from *github_script*.
 
-    Returns ``"created"``, ``"updated"``, or raises on error.
+    Returns ``"created"``, ``"updated"``, ``"skipped"``, or raises on error.
+    Scripts that already exist in TRMM with identical content are skipped so
+    that only genuine changes result in API write calls.
     """
     name: str = github_script["name"]
     category: str = github_script["category"]
@@ -354,6 +356,16 @@ def sync_script(github_script: dict, trmm_index: Dict[Tuple[str, str], dict]) ->
         existing = trmm_index[key]
         script_id: int = existing["id"]
 
+        existing_body: str = existing.get("script_body") or ""
+        existing_description: str = existing.get("description") or ""
+        new_description: str = _github_description(existing_description)
+
+        # Skip the PUT when the script body and description prefix are both
+        # already up-to-date, avoiding unnecessary writes to TRMM.
+        if existing_body == content and existing_description == new_description:
+            log.debug("Skipped  : %s [category=%s] (no changes)", name, category)
+            return "skipped"
+
         # Preserve every TRMM-managed field; only replace the script body
         # (and keep name/category/shell consistent with GitHub).
         # Description is updated to carry the [GitHub] prefix.
@@ -363,7 +375,7 @@ def sync_script(github_script: dict, trmm_index: Dict[Tuple[str, str], dict]) ->
             "shell": shell,
             "script_type": existing.get("script_type") or DEFAULT_SCRIPT_TYPE,
             "category": category,
-            "description": _github_description(existing.get("description") or ""),
+            "description": new_description,
             "args": existing.get("args") or [],
             "default_timeout": existing.get("default_timeout") or DEFAULT_TIMEOUT,
             "favorite": existing.get("favorite", False),
@@ -460,13 +472,15 @@ def main() -> None:
         sys.exit(1)
     log.info("  %d script(s) found in GitHub", len(github_scripts))
 
-    created = updated = errors = 0
+    created = updated = skipped = errors = 0
 
     for gs in github_scripts:
         try:
             result = sync_script(gs, trmm_index)
             if result == "created":
                 created += 1
+            elif result == "skipped":
+                skipped += 1
             else:
                 updated += 1
         except requests.HTTPError as exc:
@@ -531,9 +545,10 @@ def main() -> None:
             errors += 1
 
     log.info(
-        "Sync complete – created: %d  updated: %d  deleted: %d  errors: %d",
+        "Sync complete – created: %d  updated: %d  skipped: %d  deleted: %d  errors: %d",
         created,
         updated,
+        skipped,
         deleted,
         errors,
     )
