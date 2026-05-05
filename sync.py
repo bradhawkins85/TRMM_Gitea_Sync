@@ -18,8 +18,12 @@ Rules
   created by this sync tool).  Scripts created directly inside TRMM are never
   deleted.
 
-Configuration (environment variables)
---------------------------------------
+Configuration (.env file or environment variables)
+--------------------------------------------------
+Values are loaded from a ``.env`` file in the working directory (via
+python-dotenv) and then fall back to actual environment variables, so both
+approaches work.
+
 TRMM_API_URL   Base URL of the Tactical RMM instance, e.g. https://rmm.example.com
 TRMM_API_KEY   Tactical RMM API key
 GITEA_URL      Base URL of the Gitea instance, e.g. https://gitea.example.com
@@ -41,6 +45,9 @@ from typing import Dict, List, Optional, Tuple
 
 import requests
 import urllib3
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Logging
