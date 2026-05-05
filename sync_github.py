@@ -13,7 +13,10 @@ Rules
 * TRMM-managed settings (args, supported_platforms, run_as_user, env_vars,
   default_timeout, favorite, hidden) are **never** overwritten for scripts
   that already exist in TRMM.
-* TRMM scripts that have no counterpart in GitHub are left untouched.
+* Scripts removed from GitHub are deleted from TRMM, **but only if** their
+  description begins with the ``[GitHub]`` prefix (i.e. they were originally
+  created by this sync tool).  Scripts created directly inside TRMM are never
+  deleted.
 
 Configuration (environment variables)
 --------------------------------------
@@ -180,6 +183,17 @@ def _trmm_put(path: str, data: dict) -> requests.Response:
     url = f"{TRMM_API_URL}{path}"
     try:
         resp = requests.put(url, headers=_trmm_headers(), json=data, timeout=30, verify=SSL_VERIFY)
+    except requests.exceptions.RequestException as exc:
+        log.error("Network error contacting TRMM (%s): %s", url, exc)
+        raise
+    resp.raise_for_status()
+    return resp
+
+
+def _trmm_delete(path: str) -> requests.Response:
+    url = f"{TRMM_API_URL}{path}"
+    try:
+        resp = requests.delete(url, headers=_trmm_headers(), timeout=30, verify=SSL_VERIFY)
     except requests.exceptions.RequestException as exc:
         log.error("Network error contacting TRMM (%s): %s", url, exc)
         raise
@@ -472,10 +486,48 @@ def main() -> None:
             )
             errors += 1
 
+    # Build a set of (name, category) keys that exist in GitHub so we can
+    # quickly test membership when deciding what to delete.
+    github_keys = {(gs["name"], gs["category"]) for gs in github_scripts}
+
+    deleted = 0
+    for key, script in trmm_index.items():
+        # Only delete scripts that were originally created by this sync tool
+        # (identified by the [GitHub] description prefix).  Scripts created
+        # directly inside TRMM will not carry this prefix and are left alone.
+        description = script.get("description") or ""
+        if not description.startswith(GITHUB_DESCRIPTION_PREFIX):
+            continue
+        if key in github_keys:
+            continue
+        script_id = script["id"]
+        name, category = key
+        try:
+            _trmm_delete(f"/scripts/{script_id}/")
+            log.info("Deleted  : %s [category=%s]", name, category)
+            deleted += 1
+        except requests.HTTPError as exc:
+            log.error(
+                "HTTP error deleting '%s' [%s]: %s",
+                name,
+                category,
+                exc,
+            )
+            errors += 1
+        except Exception as exc:  # pylint: disable=broad-except
+            log.error(
+                "Unexpected error deleting '%s' [%s]: %s",
+                name,
+                category,
+                exc,
+            )
+            errors += 1
+
     log.info(
-        "Sync complete – created: %d  updated: %d  errors: %d",
+        "Sync complete – created: %d  updated: %d  deleted: %d  errors: %d",
         created,
         updated,
+        deleted,
         errors,
     )
 
