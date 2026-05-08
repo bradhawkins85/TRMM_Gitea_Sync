@@ -24,24 +24,31 @@ Values are loaded from a ``.env`` file in the working directory (via
 python-dotenv) and then fall back to actual environment variables, so both
 approaches work.
 
-TRMM_API_URL   Base URL of the Tactical RMM instance, e.g. https://rmm.example.com
-TRMM_API_KEY   Tactical RMM API key
-GITEA_URL      Base URL of the Gitea instance, e.g. https://gitea.example.com
-GITEA_TOKEN    Gitea access token (required for private repos)
-GITEA_OWNER    Gitea repository owner (user or org)
-GITEA_REPO     Gitea repository name
-GITEA_BRANCH   Branch to read from (default: main)
-IGNORE_SSL     Set to "true", "1", or "yes" to disable SSL certificate
-               verification for all API calls.  Useful when the script runs
-               on the TRMM server itself where the API hostname resolves to
-               127.0.0.1 and the certificate CN does not match (default: false)
+TRMM_API_URL      Base URL of the Tactical RMM instance, e.g. https://rmm.example.com
+TRMM_API_KEY      Tactical RMM API key
+GITEA_URL         Base URL of the Gitea instance, e.g. https://gitea.example.com
+GITEA_TOKEN       Gitea access token (required for private repos)
+GITEA_OWNER       Gitea repository owner (user or org)
+GITEA_REPO        Gitea repository name
+GITEA_BRANCH      Branch to read from (default: main)
+GITEA_LOCAL_PATH  Path to the local clone of the Gitea repo (default: ./gitea_repo).
+                  On first run the repo is cloned here; subsequent runs do a
+                  ``git pull`` and only scripts whose files changed are synced.
+FULL_SYNC         Set to "true", "1", or "yes" to sync every script regardless
+                  of what changed in git.  Useful to force a complete re-sync
+                  after editing TRMM scripts manually (default: false).
+IGNORE_SSL        Set to "true", "1", or "yes" to disable SSL certificate
+                  verification for all API calls.  Useful when the script runs
+                  on the TRMM server itself where the API hostname resolves to
+                  127.0.0.1 and the certificate CN does not match (default: false)
 """
 
-import base64
 import logging
 import os
+import subprocess
 import sys
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
+from urllib.parse import urlparse, urlunparse
 
 import requests
 import urllib3
@@ -71,6 +78,9 @@ GITEA_TOKEN: str = os.environ.get("GITEA_TOKEN", "")
 GITEA_OWNER: str = os.environ.get("GITEA_OWNER", "")
 GITEA_REPO: str = os.environ.get("GITEA_REPO", "")
 GITEA_BRANCH: str = os.environ.get("GITEA_BRANCH", "main")
+GITEA_LOCAL_PATH: str = os.environ.get("GITEA_LOCAL_PATH", "./gitea_repo")
+
+FULL_SYNC: bool = os.environ.get("FULL_SYNC", "").lower() in ("1", "true", "yes")
 
 IGNORE_SSL: bool = os.environ.get("IGNORE_SSL", "").lower() in ("1", "true", "yes")
 SSL_VERIFY: bool = not IGNORE_SSL
@@ -103,48 +113,216 @@ DEFAULT_SCRIPT_TYPE: str = "userdefined"
 DEFAULT_TIMEOUT: int = 90
 
 # ---------------------------------------------------------------------------
-# Gitea API helpers
+# Git / local-clone helpers
 # ---------------------------------------------------------------------------
 
 
-def _gitea_headers() -> Dict[str, str]:
-    return {"Authorization": f"token {GITEA_TOKEN}"}
+def _build_clone_url() -> str:
+    """Return the authenticated HTTPS clone URL for the configured Gitea repo."""
+    parsed = urlparse(GITEA_URL)
+    netloc_with_auth = f"oauth2:{GITEA_TOKEN}@{parsed.netloc}"
+    repo_path = f"/{GITEA_OWNER}/{GITEA_REPO}.git"
+    return urlunparse((parsed.scheme, netloc_with_auth, repo_path, "", "", ""))
 
 
-def _gitea_get(path: str, params: Optional[Dict] = None) -> requests.Response:
-    url = f"{GITEA_URL}/api/v1{path}"
+def _git_run(args: List[str], cwd: Optional[str] = None) -> subprocess.CompletedProcess:
+    """Run a git sub-command and return the CompletedProcess.  Raises RuntimeError on failure."""
+    result = subprocess.run(
+        ["git"] + args,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        # Avoid leaking the token that may appear in URLs within error messages.
+        safe_stderr = result.stderr.replace(GITEA_TOKEN, "***") if GITEA_TOKEN else result.stderr
+        raise RuntimeError(f"git {' '.join(args[:2])} failed: {safe_stderr.strip()}")
+    return result
+
+
+def _ensure_local_repo() -> Tuple[bool, List[str], List[str]]:
+    """Ensure a local clone of the Gitea repo exists at ``GITEA_LOCAL_PATH``.
+
+    * On the first run (or when the directory is not a git repository) the repo
+      is cloned from Gitea.
+    * On subsequent runs ``git pull`` is executed and the files that changed
+      between the previous HEAD and the new HEAD are recorded.
+
+    Returns:
+        (is_fresh_clone, modified_paths, deleted_paths)
+
+    ``is_fresh_clone`` is ``True`` when the repo was just cloned for the first
+    time; in that case ``modified_paths`` and ``deleted_paths`` are both empty
+    (the caller should treat every file as new).
+
+    ``modified_paths`` and ``deleted_paths`` contain repository-relative POSIX
+    paths (e.g. ``"Checks/Check Disk Space.ps1"``).
+    """
+    local_path = os.path.abspath(GITEA_LOCAL_PATH)
+
+    is_git_repo = os.path.isdir(os.path.join(local_path, ".git"))
+
+    if not is_git_repo:
+        if os.path.exists(local_path) and os.listdir(local_path):
+            log.error(
+                "GITEA_LOCAL_PATH '%s' already exists and is not a git repository. "
+                "Remove or empty the directory, or set GITEA_LOCAL_PATH to a different path.",
+                local_path,
+            )
+            raise RuntimeError(f"Not a git repository: {local_path}")
+
+        log.info("Cloning Gitea repo to %s …", local_path)
+        clone_url = _build_clone_url()
+        _git_run(["clone", "--branch", GITEA_BRANCH, clone_url, local_path])
+        log.info("  Clone complete")
+        return True, [], []
+
+    # Existing clone – pull and collect changed paths.
+    old_head = _git_run(["rev-parse", "HEAD"], cwd=local_path).stdout.strip()
+
+    # Keep the remote URL up to date in case the token has changed.
+    clone_url = _build_clone_url()
+    _git_run(["remote", "set-url", "origin", clone_url], cwd=local_path)
+
+    log.info("Pulling latest changes in %s …", local_path)
+    _git_run(["pull", "origin", GITEA_BRANCH], cwd=local_path)
+
+    new_head = _git_run(["rev-parse", "HEAD"], cwd=local_path).stdout.strip()
+
+    if old_head == new_head:
+        log.info("  Already up to date (HEAD=%s)", new_head[:8])
+        return False, [], []
+
+    log.info("  Updated %s → %s", old_head[:8], new_head[:8])
+
+    diff_output = _git_run(
+        ["diff", "--name-status", old_head, new_head],
+        cwd=local_path,
+    ).stdout.strip()
+
+    modified_paths: List[str] = []
+    deleted_paths: List[str] = []
+
+    for line in diff_output.splitlines():
+        if not line:
+            continue
+        parts = line.split("\t")
+        status = parts[0]
+        if status.startswith("R"):
+            # Rename: R<score>\t<old_path>\t<new_path>
+            if len(parts) >= 3:
+                deleted_paths.append(parts[1])
+                modified_paths.append(parts[2])
+        elif status.startswith("C"):
+            # Copy: C<score>\t<src_path>\t<dst_path> – only the new file needs syncing
+            if len(parts) >= 3:
+                modified_paths.append(parts[2])
+        elif status in ("A", "M"):
+            if len(parts) >= 2:
+                modified_paths.append(parts[1])
+        elif status == "D":
+            if len(parts) >= 2:
+                deleted_paths.append(parts[1])
+
+    return False, modified_paths, deleted_paths
+
+
+# ---------------------------------------------------------------------------
+# Script discovery (local filesystem)
+# ---------------------------------------------------------------------------
+
+
+def _shell_from_filename(filename: str) -> Optional[str]:
+    """Return the TRMM shell type for *filename*, or None if not recognised."""
+    _, ext = os.path.splitext(filename.lower())
+    return EXTENSION_TO_SHELL.get(ext)
+
+
+def _append_local_script(
+    scripts: List[dict], file_path: str, category: str
+) -> None:
+    """Read *file_path* from disk and append a script entry to *scripts*."""
+    filename = os.path.basename(file_path)
+    shell = _shell_from_filename(filename)
+    if shell is None:
+        log.debug("Skipping unsupported file type: %s/%s", category, filename)
+        return
+
+    name, _ = os.path.splitext(filename)
+
     try:
-        resp = requests.get(url, headers=_gitea_headers(), params=params or {}, timeout=30, verify=SSL_VERIFY)
-    except requests.exceptions.RequestException as exc:
-        log.error("Network error contacting Gitea (%s): %s", url, exc)
-        raise
-    resp.raise_for_status()
-    return resp
+        with open(file_path, "rb") as fh:
+            raw = fh.read()
+    except OSError as exc:
+        log.warning("Could not read file %s: %s", file_path, exc)
+        return
 
-
-def list_gitea_contents(path: str = "") -> List[dict]:
-    """Return the directory listing at *path* in the configured repo."""
-    api_path = f"/repos/{GITEA_OWNER}/{GITEA_REPO}/contents/{path}"
-    return _gitea_get(api_path, {"ref": GITEA_BRANCH}).json()
-
-
-def get_gitea_file_content(path: str) -> str:
-    """Return the decoded text content of a file in the configured repo."""
-    api_path = f"/repos/{GITEA_OWNER}/{GITEA_REPO}/contents/{path}"
-    data = _gitea_get(api_path, {"ref": GITEA_BRANCH}).json()
-    # Gitea encodes file content as base64; strip embedded newlines before decoding.
-    # Use "utf-8-sig" so that a UTF-8 BOM (common in Windows-authored PowerShell
-    # files) is silently stripped rather than included in the script body.
-    encoded = data["content"].replace("\n", "")
-    raw = base64.b64decode(encoded)
     try:
-        text = raw.decode("utf-8-sig")
+        content = raw.decode("utf-8-sig")
     except UnicodeDecodeError:
-        text = raw.decode("latin-1")
-    # Normalize Windows-style line endings so that the body compared against
-    # what TRMM stores uses a consistent line-ending style, preventing spurious
-    # updates on every sync run when scripts contain \r\n.
-    return text.replace("\r\n", "\n")
+        content = raw.decode("latin-1")
+
+    # Normalise Windows-style line endings.
+    content = content.replace("\r\n", "\n")
+
+    scripts.append(
+        {
+            "name": name,
+            "category": category,
+            "shell": shell,
+            "content": content,
+        }
+    )
+
+
+def collect_local_scripts(filter_paths: Optional[Set[str]] = None) -> List[dict]:
+    """Walk the local clone and return one dict per script.
+
+    Only files that are **direct children of a top-level directory** are
+    processed; nested sub-directories are skipped.  Files at the repository
+    root are assigned an empty-string category.
+
+    If *filter_paths* is provided (a set of repository-relative POSIX paths),
+    only scripts whose path is in the set are returned, enabling incremental
+    syncing when only a subset of files changed.
+    """
+    local_path = os.path.abspath(GITEA_LOCAL_PATH)
+    scripts: List[dict] = []
+
+    try:
+        root_entries = list(os.scandir(local_path))
+    except OSError as exc:
+        log.error("Cannot scan local repo at %s: %s", local_path, exc)
+        raise
+
+    for entry in root_entries:
+        if entry.name.startswith("."):
+            continue
+
+        if entry.is_dir(follow_symlinks=False):
+            category = entry.name
+            try:
+                dir_entries = list(os.scandir(entry.path))
+            except OSError as exc:
+                log.warning("Could not scan directory %s: %s", entry.path, exc)
+                continue
+
+            for file_entry in dir_entries:
+                if not file_entry.is_file(follow_symlinks=False):
+                    # Skip nested sub-directories.
+                    continue
+                rel_path = f"{category}/{file_entry.name}"
+                if filter_paths is not None and rel_path not in filter_paths:
+                    continue
+                _append_local_script(scripts, file_entry.path, category)
+
+        elif entry.is_file(follow_symlinks=False):
+            rel_path = entry.name
+            if filter_paths is not None and rel_path not in filter_paths:
+                continue
+            _append_local_script(scripts, entry.path, "")
+
+    return scripts
 
 
 # ---------------------------------------------------------------------------
@@ -241,79 +419,6 @@ def get_all_trmm_scripts() -> Dict[Tuple[str, str], dict]:
         key = (name, script.get("category") or "")
         index[key] = script
     return index
-
-
-# ---------------------------------------------------------------------------
-# Script discovery
-# ---------------------------------------------------------------------------
-
-
-def _shell_from_filename(filename: str) -> Optional[str]:
-    """Return the TRMM shell type for *filename*, or None if not recognised."""
-    _, ext = os.path.splitext(filename.lower())
-    return EXTENSION_TO_SHELL.get(ext)
-
-
-def collect_gitea_scripts() -> List[dict]:
-    """
-    Walk the top-level of the Gitea repo and return one dict per script::
-
-        {"name": str, "category": str, "shell": str, "content": str}
-
-    Only files that are **direct children of a top-level directory** are
-    processed (nested sub-directories are skipped).  Files at the repository
-    root are assigned an empty-string category.
-    """
-    scripts: List[dict] = []
-    root_items = list_gitea_contents("")
-
-    for item in root_items:
-        if item["type"] == "dir":
-            category = item["name"]
-            try:
-                dir_items = list_gitea_contents(item["path"])
-            except requests.HTTPError as exc:
-                log.warning("Could not list directory %s: %s", item["path"], exc)
-                continue
-
-            for file_item in dir_items:
-                if file_item["type"] != "file":
-                    # Skip nested subdirectories – only the top-level folder
-                    # is used as the category.
-                    continue
-                _append_script(scripts, file_item, category)
-
-        elif item["type"] == "file":
-            # Root-level script – category is an empty string
-            _append_script(scripts, item, "")
-
-    return scripts
-
-
-def _append_script(scripts: List[dict], file_item: dict, category: str) -> None:
-    """Helper: validate *file_item* and append a script entry to *scripts*."""
-    filename = file_item["name"]
-    shell = _shell_from_filename(filename)
-    if shell is None:
-        log.debug("Skipping unsupported file type: %s/%s", category, filename)
-        return
-
-    name, _ = os.path.splitext(filename)
-
-    try:
-        content = get_gitea_file_content(file_item["path"])
-    except requests.HTTPError as exc:
-        log.warning("Could not fetch file %s: %s", file_item["path"], exc)
-        return
-
-    scripts.append(
-        {
-            "name": name,
-            "category": category,
-            "shell": shell,
-            "content": content,
-        }
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -464,7 +569,32 @@ def main() -> None:
         GITEA_BRANCH,
     )
     log.info("TRMM  : %s", TRMM_API_URL)
+    log.info("Local repo path: %s", os.path.abspath(GITEA_LOCAL_PATH))
+    if FULL_SYNC:
+        log.info("FULL_SYNC is enabled – all scripts will be synced regardless of changes")
 
+    # ------------------------------------------------------------------
+    # Step 1 – Ensure the local git clone is up to date.
+    # ------------------------------------------------------------------
+    try:
+        is_fresh_clone, modified_paths, deleted_paths = _ensure_local_repo()
+    except Exception as exc:  # pylint: disable=broad-except
+        log.error("Failed to prepare local Gitea repo: %s", exc)
+        sys.exit(1)
+
+    # Decide whether to do a full or incremental sync:
+    #  * Always full on the first clone (all files are "new").
+    #  * Always full when FULL_SYNC=true.
+    #  * Incremental otherwise (only process files that changed).
+    do_full: bool = FULL_SYNC or is_fresh_clone
+
+    if not do_full and not modified_paths and not deleted_paths:
+        log.info("No changes detected in Gitea repo – nothing to sync")
+        return
+
+    # ------------------------------------------------------------------
+    # Step 2 – Fetch the current TRMM script index.
+    # ------------------------------------------------------------------
     log.info("Fetching scripts from TRMM …")
     try:
         trmm_index = get_all_trmm_scripts()
@@ -473,14 +603,32 @@ def main() -> None:
         sys.exit(1)
     log.info("  %d script(s) found in TRMM", len(trmm_index))
 
-    log.info("Fetching scripts from Gitea …")
-    try:
-        gitea_scripts = collect_gitea_scripts()
-    except requests.exceptions.RequestException as exc:
-        log.error("Failed to fetch scripts from Gitea: %s", exc)
-        sys.exit(1)
-    log.info("  %d script(s) found in Gitea", len(gitea_scripts))
+    # ------------------------------------------------------------------
+    # Step 3 – Collect scripts from the local clone.
+    # ------------------------------------------------------------------
+    if do_full:
+        log.info("Collecting all scripts from local Gitea clone …")
+        try:
+            gitea_scripts = collect_local_scripts()
+        except OSError as exc:
+            log.error("Failed to read local Gitea repo: %s", exc)
+            sys.exit(1)
+    else:
+        log.info(
+            "Collecting %d changed file(s) from local Gitea clone …",
+            len(modified_paths),
+        )
+        try:
+            gitea_scripts = collect_local_scripts(filter_paths=set(modified_paths))
+        except OSError as exc:
+            log.error("Failed to read local Gitea repo: %s", exc)
+            sys.exit(1)
 
+    log.info("  %d script(s) to process", len(gitea_scripts))
+
+    # ------------------------------------------------------------------
+    # Step 4 – Create / update scripts in TRMM.
+    # ------------------------------------------------------------------
     created = updated = skipped = errors = 0
 
     for gs in gitea_scripts:
@@ -516,42 +664,92 @@ def main() -> None:
             )
             errors += 1
 
-    # Build a set of (name, category) keys that exist in Gitea so we can
-    # quickly test membership when deciding what to delete.
-    gitea_keys = {(gs["name"], gs["category"]) for gs in gitea_scripts}
-
+    # ------------------------------------------------------------------
+    # Step 5 – Delete TRMM scripts that were removed from Gitea.
+    # ------------------------------------------------------------------
     deleted = 0
-    for key, script in trmm_index.items():
-        # Only delete scripts that were originally created by this sync tool
-        # (identified by the [Gitea] description prefix).  Scripts created
-        # directly inside TRMM will not carry this prefix and are left alone.
-        description = script.get("description") or ""
-        if not description.startswith(GITEA_DESCRIPTION_PREFIX):
-            continue
-        if key in gitea_keys:
-            continue
-        script_id = script["id"]
-        name, category = key
-        try:
-            _trmm_delete(f"/scripts/{script_id}/")
-            log.info("Deleted  : %s [category=%s]", name, category)
-            deleted += 1
-        except requests.HTTPError as exc:
-            log.error(
-                "HTTP error deleting '%s' [%s]: %s",
-                name,
-                category,
-                exc,
-            )
-            errors += 1
-        except Exception as exc:  # pylint: disable=broad-except
-            log.error(
-                "Unexpected error deleting '%s' [%s]: %s",
-                name,
-                category,
-                exc,
-            )
-            errors += 1
+
+    if do_full:
+        # Full sync: remove any TRMM script (with the [Gitea] prefix) whose
+        # counterpart no longer exists anywhere in the repo.
+        gitea_keys = {(gs["name"], gs["category"]) for gs in gitea_scripts}
+        for key, script in trmm_index.items():
+            description = script.get("description") or ""
+            if not description.startswith(GITEA_DESCRIPTION_PREFIX):
+                continue
+            if key in gitea_keys:
+                continue
+            script_id = script["id"]
+            name, category = key
+            try:
+                _trmm_delete(f"/scripts/{script_id}/")
+                log.info("Deleted  : %s [category=%s]", name, category)
+                deleted += 1
+            except requests.HTTPError as exc:
+                log.error(
+                    "HTTP error deleting '%s' [%s]: %s",
+                    name,
+                    category,
+                    exc,
+                )
+                errors += 1
+            except Exception as exc:  # pylint: disable=broad-except
+                log.error(
+                    "Unexpected error deleting '%s' [%s]: %s",
+                    name,
+                    category,
+                    exc,
+                )
+                errors += 1
+    else:
+        # Incremental sync: only delete TRMM scripts for files that git
+        # explicitly reported as deleted in this pull.
+        for rel_path in deleted_paths:
+            parts = rel_path.replace("\\", "/").split("/")
+            if len(parts) == 1:
+                filename, category = parts[0], ""
+            elif len(parts) == 2:
+                category, filename = parts[0], parts[1]
+            else:
+                # Nested path – outside our one-level category model; skip.
+                continue
+
+            shell = _shell_from_filename(filename)
+            if shell is None:
+                continue
+
+            name, _ = os.path.splitext(filename)
+            key = (name, category)
+
+            if key not in trmm_index:
+                continue
+
+            script = trmm_index[key]
+            description = script.get("description") or ""
+            if not description.startswith(GITEA_DESCRIPTION_PREFIX):
+                continue
+
+            script_id = script["id"]
+            try:
+                _trmm_delete(f"/scripts/{script_id}/")
+                log.info("Deleted  : %s [category=%s]", name, category)
+                deleted += 1
+            except requests.HTTPError as exc:
+                log.error(
+                    "HTTP error deleting '%s' [%s]: %s",
+                    name,
+                    category,
+                    exc,
+                )
+                errors += 1
+            except Exception as exc:  # pylint: disable=broad-except
+                log.error(
+                    "Unexpected error deleting '%s' [%s]: %s",
+                    name,
+                    category,
+                    exc,
+                )
+                errors += 1
 
     log.info(
         "Sync complete – created: %d  updated: %d  skipped: %d  deleted: %d  errors: %d",

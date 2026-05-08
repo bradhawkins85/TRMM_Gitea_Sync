@@ -7,11 +7,17 @@ repository with the script library in **Tactical RMM (TRMM)**.
 
 ## How It Works
 
-1. The script reads every file inside the top-level directories of the
-   configured Gitea repository.
-2. The **top-level folder name** becomes the TRMM **category**.
-3. The **filename** (without extension) becomes the TRMM **script name**.
-4. The **file extension** determines the TRMM **shell type**:
+1. On the **first run** `sync.py` clones the configured Gitea repository to a
+   local directory (`GITEA_LOCAL_PATH`, default `./gitea_repo`).
+2. On **subsequent runs** it executes `git pull` and records which files changed.
+   Only the scripts whose source files were added, modified, renamed, or deleted
+   in that pull are touched in TRMM – everything else is left as-is, making
+   incremental syncs very fast regardless of repo size.
+3. Set `FULL_SYNC=true` to force every script to be compared and re-synced
+   (useful after manually editing scripts inside TRMM).
+4. The **top-level folder name** becomes the TRMM **category**.
+5. The **filename** (without extension) becomes the TRMM **script name**.
+6. The **file extension** determines the TRMM **shell type**:
 
    | Extension | Shell        |
    |-----------|-------------|
@@ -56,16 +62,18 @@ pip install -r requirements.txt
 
 All configuration is supplied via **environment variables**.
 
-| Variable       | Required | Description                                                  |
-|----------------|----------|--------------------------------------------------------------|
-| `TRMM_API_URL` | ✅       | Base URL of the TRMM instance, e.g. `https://rmm.example.com` |
-| `TRMM_API_KEY` | ✅       | Tactical RMM API key                                         |
-| `GITEA_URL`    | ✅       | Base URL of the Gitea instance, e.g. `https://git.example.com` |
-| `GITEA_TOKEN`  | ✅       | Gitea personal access token (required for private repos)     |
-| `GITEA_OWNER`  | ✅       | Gitea repository owner (user or organisation name)           |
-| `GITEA_REPO`   | ✅       | Gitea repository name                                        |
-| `GITEA_BRANCH` | ❌       | Branch to sync from (default: `main`)                        |
-| `IGNORE_SSL`   | ❌       | Set to `true`, `1`, or `yes` to disable SSL certificate verification for all API calls. Useful when running on the TRMM server where the API hostname resolves to `127.0.0.1` and the TLS certificate CN does not match (default: `false`) |
+| Variable           | Required | Description                                                  |
+|--------------------|----------|--------------------------------------------------------------|
+| `TRMM_API_URL`     | ✅       | Base URL of the TRMM instance, e.g. `https://rmm.example.com` |
+| `TRMM_API_KEY`     | ✅       | Tactical RMM API key                                         |
+| `GITEA_URL`        | ✅       | Base URL of the Gitea instance, e.g. `https://git.example.com` |
+| `GITEA_TOKEN`      | ✅       | Gitea personal access token (required for private repos)     |
+| `GITEA_OWNER`      | ✅       | Gitea repository owner (user or organisation name)           |
+| `GITEA_REPO`       | ✅       | Gitea repository name                                        |
+| `GITEA_BRANCH`     | ❌       | Branch to sync from (default: `main`)                        |
+| `GITEA_LOCAL_PATH` | ❌       | Path for the local git clone (default: `./gitea_repo`). The repo is cloned automatically on first run; subsequent runs do `git pull` and only sync changed files. |
+| `FULL_SYNC`        | ❌       | Set to `true`, `1`, or `yes` to sync all scripts on every run instead of only changed ones (default: `false`). |
+| `IGNORE_SSL`       | ❌       | Set to `true`, `1`, or `yes` to disable SSL certificate verification for all API calls. Useful when running on the TRMM server where the API hostname resolves to `127.0.0.1` and the TLS certificate CN does not match (default: `false`) |
 
 ---
 
