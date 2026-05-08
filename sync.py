@@ -163,7 +163,13 @@ def _ensure_local_repo() -> Tuple[bool, List[str], List[str]]:
     is_git_repo = os.path.isdir(os.path.join(local_path, ".git"))
 
     if not is_git_repo:
-        if os.path.exists(local_path) and os.listdir(local_path):
+        non_empty = False
+        if os.path.exists(local_path):
+            try:
+                non_empty = bool(os.listdir(local_path))
+            except OSError:
+                non_empty = True  # conservative: assume non-empty on access error
+        if non_empty:
             log.error(
                 "GITEA_LOCAL_PATH '%s' already exists and is not a git repository. "
                 "Remove or empty the directory, or set GITEA_LOCAL_PATH to a different path.",
@@ -273,6 +279,27 @@ def _append_local_script(
             "content": content,
         }
     )
+
+
+def _parse_script_path(rel_path: str) -> Optional[Tuple[str, str]]:
+    """Parse a repo-relative path into ``(script_name, category)``.
+
+    Returns ``None`` for unsupported file types or nested paths (more than one
+    directory level deep), as those are outside our one-level category model.
+    """
+    parts = rel_path.replace("\\", "/").split("/")
+    if len(parts) == 1:
+        filename, category = parts[0], ""
+    elif len(parts) == 2:
+        category, filename = parts[0], parts[1]
+    else:
+        return None  # nested path – skip
+
+    if _shell_from_filename(filename) is None:
+        return None
+
+    name, _ = os.path.splitext(filename)
+    return name, category
 
 
 def collect_local_scripts(filter_paths: Optional[Set[str]] = None) -> List[dict]:
@@ -586,9 +613,9 @@ def main() -> None:
     #  * Always full on the first clone (all files are "new").
     #  * Always full when FULL_SYNC=true.
     #  * Incremental otherwise (only process files that changed).
-    do_full: bool = FULL_SYNC or is_fresh_clone
+    is_full_sync: bool = FULL_SYNC or is_fresh_clone
 
-    if not do_full and not modified_paths and not deleted_paths:
+    if not is_full_sync and not modified_paths and not deleted_paths:
         log.info("No changes detected in Gitea repo – nothing to sync")
         return
 
@@ -606,7 +633,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Step 3 – Collect scripts from the local clone.
     # ------------------------------------------------------------------
-    if do_full:
+    if is_full_sync:
         log.info("Collecting all scripts from local Gitea clone …")
         try:
             gitea_scripts = collect_local_scripts()
@@ -669,7 +696,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     deleted = 0
 
-    if do_full:
+    if is_full_sync:
         # Full sync: remove any TRMM script (with the [Gitea] prefix) whose
         # counterpart no longer exists anywhere in the repo.
         gitea_keys = {(gs["name"], gs["category"]) for gs in gitea_scripts}
@@ -705,20 +732,10 @@ def main() -> None:
         # Incremental sync: only delete TRMM scripts for files that git
         # explicitly reported as deleted in this pull.
         for rel_path in deleted_paths:
-            parts = rel_path.replace("\\", "/").split("/")
-            if len(parts) == 1:
-                filename, category = parts[0], ""
-            elif len(parts) == 2:
-                category, filename = parts[0], parts[1]
-            else:
-                # Nested path – outside our one-level category model; skip.
+            parsed = _parse_script_path(rel_path)
+            if parsed is None:
                 continue
-
-            shell = _shell_from_filename(filename)
-            if shell is None:
-                continue
-
-            name, _ = os.path.splitext(filename)
+            name, category = parsed
             key = (name, category)
 
             if key not in trmm_index:
