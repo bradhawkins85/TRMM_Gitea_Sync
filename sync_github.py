@@ -225,6 +225,12 @@ def save_state(guid_map: Dict[str, str], sha_map: Dict[str, str]) -> None:
                 json.dump(payload, fh, indent=2, sort_keys=True)
                 fh.write("\n")
             os.replace(tmp_path, path)
+            # On POSIX, restrict the state file to the owner – best-effort,
+            # silently ignored where chmod is unsupported (e.g. Windows).
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
         except Exception:
             try:
                 os.unlink(tmp_path)
@@ -816,18 +822,44 @@ def main() -> None:
     new_paths: Set[str] = current_paths - set(state.keys())
 
     # Build a reverse lookup of previously-seen SHAs that no longer have
-    # their original path present in the repo.
-    candidate_renames: Dict[str, str] = {}  # sha → old_path
+    # their original path present in the repo.  Multiple deleted paths can
+    # share the same SHA (e.g. duplicated stub scripts), so collect them
+    # into a list and disambiguate per new path below.
+    candidate_renames: Dict[str, List[str]] = {}  # sha → [old_path, ...]
     for old_path in missing_paths:
         sha = previous_shas.get(old_path)
         if sha:
-            candidate_renames.setdefault(sha, old_path)
+            candidate_renames.setdefault(sha, []).append(old_path)
 
     rename_map: Dict[str, str] = {}  # new_path → old_path
     for new_path in new_paths:
         sha = current_shas.get(new_path)
-        if sha and sha in candidate_renames:
-            rename_map[new_path] = candidate_renames.pop(sha)
+        if not sha or sha not in candidate_renames:
+            continue
+        candidates = candidate_renames[sha]
+        if not candidates:
+            continue
+        # When several deleted paths share the same SHA, prefer the one that
+        # most closely resembles the new path (same basename, then same
+        # top-level category) so each new path is paired with the most
+        # plausible original.  Falls back to the first candidate otherwise.
+        new_base = os.path.basename(new_path)
+        new_top = new_path.split("/")[0] if "/" in new_path else ""
+        chosen: Optional[str] = None
+        for cand in candidates:
+            if os.path.basename(cand) == new_base:
+                chosen = cand
+                break
+        if chosen is None:
+            for cand in candidates:
+                cand_top = cand.split("/")[0] if "/" in cand else ""
+                if cand_top == new_top:
+                    chosen = cand
+                    break
+        if chosen is None:
+            chosen = candidates[0]
+        candidates.remove(chosen)
+        rename_map[new_path] = chosen
 
     if rename_map:
         log.info(

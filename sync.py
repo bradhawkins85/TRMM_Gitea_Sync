@@ -227,6 +227,14 @@ def save_state(state: Dict[str, str]) -> None:
                 json.dump(payload, fh, indent=2, sort_keys=True)
                 fh.write("\n")
             os.replace(tmp_path, path)
+            # On POSIX, restrict the state file to the owner – it contains
+            # TRMM script guids which, while not secret, are internal
+            # identifiers that don't need to be world-readable.  Best-effort:
+            # silently ignored where chmod is unsupported (e.g. Windows).
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
         except Exception:
             # Best-effort cleanup of the temp file on failure.
             try:
@@ -332,11 +340,11 @@ def _ensure_local_repo() -> Tuple[bool, List[str], List[str], List[Tuple[str, st
 
     log.info("  Updated %s → %s", old_head[:8], new_head[:8])
 
-    # ``-M50%`` lowers the rename-detection similarity threshold from git's
-    # default (50%) but states it explicitly so that a future change to the
-    # default does not silently regress rename handling.  Files that are both
-    # renamed *and* modified are still detected as renames as long as at least
-    # half their content survives.
+    # ``-M50%`` explicitly pins the rename-detection similarity threshold at
+    # git's documented default (50%) so that a future change to the default
+    # cannot silently regress rename handling.  Files that are both renamed
+    # *and* modified are still detected as renames as long as at least half
+    # their content survives.
     diff_output = _git_run(
         ["diff", "--name-status", "-M50%", old_head, new_head],
         cwd=local_path,
