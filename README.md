@@ -39,9 +39,73 @@ repository with the script library in **Tactical RMM (TRMM)**.
   `args`, `supported_platforms`, `run_as_user`, `env_vars`,
   `default_timeout`, `favorite`, `hidden`.
 - The `description` field of every synchronised script is prefixed with
-  `[Gitea]` so that Gitea-managed scripts are easy to identify in TRMM.
-  The prefix is applied idempotently – repeated sync runs will not
-  accumulate multiple `[Gitea]` tags.
+  `[Gitea:<trmm-guid>]` (or just `[Gitea]` for legacy scripts) so that
+  Gitea-managed scripts are easy to identify in TRMM.  The prefix is
+  applied idempotently – repeated sync runs will not accumulate multiple
+  prefixes.
+
+---
+
+## How Scripts Are Matched
+
+Gitea files and TRMM scripts are matched on a **stable identifier** so that
+renaming or moving a script in Gitea is reflected as a rename/move in TRMM
+rather than a delete-and-recreate (which would otherwise discard the TRMM
+script `id` and every preserved setting listed above).
+
+The identifier used is TRMM's own `guid` field, which is assigned to every
+script when it is first created.  No changes are required on the TRMM side –
+the sync tool tracks the binding itself in two places:
+
+1. **A small JSON state file** (`.trmm_sync_state.json`) kept next to the
+   local Gitea clone.  It stores a `repo-relative-path → TRMM-guid` map
+   that survives across runs.  The file is rewritten atomically at the end
+   of every successful sync.
+2. **The TRMM `description` field**, which carries a `[Gitea:<guid>]`
+   prefix as a belt-and-braces backup.  If the JSON state file is lost or
+   corrupted, the binding is re-derived from the description on the next run.
+
+### Matching algorithm
+
+For every Gitea script, the sync resolves the matching TRMM script in this
+order:
+
+1. **By `guid`** via the state file (`path → guid` → TRMM script).
+2. **By `(name, category)`** against TRMM (used for first-time *adoption* of
+   pre-existing TRMM scripts that have not yet been bound to a guid).
+3. **By the `[Gitea:<guid>]` description stamp** (used to recover the
+   binding when the state file is missing).
+4. If no match is found, a new TRMM script is created and the resulting
+   guid is recorded in the state file.
+
+### Renames and moves
+
+* For `sync.py` (Gitea), the script asks `git diff --name-status -M50%` to
+  detect renames between the previous and current `HEAD`.  Each rename
+  pair is processed by updating the existing TRMM script's `name` and/or
+  `category` in place, preserving its `id` and all TRMM-managed settings.
+* For `sync_github.py` (GitHub), there is no git history to inspect.
+  Renames are inferred by matching identical blob SHAs across runs:
+  if a path that was present in the previous run disappears and a new
+  path with the same blob SHA appears, the binding is carried forward to
+  the new path.
+
+In both cases the **state file is updated** so future runs see the new
+path bound to the same guid.
+
+### State file location
+
+By default the state file lives **next to** `GITEA_LOCAL_PATH` (i.e. in
+its parent directory) so that wiping the local clone with `rm -rf` does
+not also delete the mapping.  Override the location via the
+`SYNC_STATE_FILE` environment variable.
+
+### What if the state file is lost?
+
+The next run rebuilds it from the `[Gitea:<guid>]` (or `[GitHub:<guid>]`)
+description stamps, falling back to `(name, category)` adoption for any
+scripts that pre-date the stamping.  No data is lost; you may just see a
+batch of "Updated" log lines as the descriptions are re-stamped.
 
 ---
 
@@ -74,6 +138,7 @@ All configuration is supplied via **environment variables**.
 | `GITEA_LOCAL_PATH` | ❌       | Path for the local git clone (default: `./gitea_repo`). The repo is cloned automatically on first run; subsequent runs do `git pull` and only sync changed files. |
 | `FULL_SYNC`        | ❌       | Set to `true`, `1`, or `yes` to sync all scripts on every run instead of only changed ones (default: `false`). |
 | `IGNORE_SSL`       | ❌       | Set to `true`, `1`, or `yes` to disable SSL certificate verification for all API calls. Useful when running on the TRMM server where the API hostname resolves to `127.0.0.1` and the TLS certificate CN does not match (default: `false`) |
+| `SYNC_STATE_FILE`  | ❌       | Path to the persistent JSON state file that stores the `repo-relative-path → TRMM-guid` mapping (used to track renames/moves). Defaults to a sibling of `GITEA_LOCAL_PATH` (e.g. `./.trmm_sync_state.json`). For `sync_github.py`, defaults to `./.trmm_github_sync_state.json` in the working directory. |
 
 ---
 
