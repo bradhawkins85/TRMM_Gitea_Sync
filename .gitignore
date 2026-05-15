@@ -39,3 +39,8 @@ Thumbs.db
 
 # Local Gitea repository clone created by sync.py
 gitea_repo/
+
+# Persistent state files written by sync.py / sync_github.py to track the
+# repo-relative-path → TRMM script guid mapping across runs.
+.trmm_sync_state.json
+.trmm_github_sync_state.json

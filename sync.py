@@ -43,10 +43,13 @@ IGNORE_SSL        Set to "true", "1", or "yes" to disable SSL certificate
                   127.0.0.1 and the certificate CN does not match (default: false)
 """
 
+import json
 import logging
 import os
+import re
 import subprocess
 import sys
+import tempfile
 from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse, urlunparse
 
@@ -82,6 +85,12 @@ GITEA_LOCAL_PATH: str = os.environ.get("GITEA_LOCAL_PATH", "./gitea_repo")
 
 FULL_SYNC: bool = os.environ.get("FULL_SYNC", "").lower() in ("1", "true", "yes")
 
+# Path to the persistent JSON state file that tracks the
+# repo-relative-path → TRMM-guid mapping across runs.  Defaults to a sibling of
+# the local Gitea clone (``<parent of GITEA_LOCAL_PATH>/.trmm_sync_state.json``)
+# so that ``rm -rf`` of the clone does not also delete the state file.
+SYNC_STATE_FILE: str = os.environ.get("SYNC_STATE_FILE", "")
+
 IGNORE_SSL: bool = os.environ.get("IGNORE_SSL", "").lower() in ("1", "true", "yes")
 SSL_VERIFY: bool = not IGNORE_SSL
 
@@ -113,6 +122,123 @@ DEFAULT_SCRIPT_TYPE: str = "userdefined"
 DEFAULT_TIMEOUT: int = 90
 
 # ---------------------------------------------------------------------------
+# Persistent state (path → TRMM guid mapping)
+# ---------------------------------------------------------------------------
+
+STATE_FILE_VERSION: int = 1
+
+
+def _default_state_file_path() -> str:
+    """Return the default location for the JSON state file.
+
+    Sibling of ``GITEA_LOCAL_PATH`` (i.e. lives in its parent directory) so a
+    ``rm -rf`` of the clone does not also delete the mapping file.
+    """
+    local_abs = os.path.abspath(GITEA_LOCAL_PATH)
+    parent = os.path.dirname(local_abs) or "."
+    return os.path.join(parent, ".trmm_sync_state.json")
+
+
+def _state_file_path() -> str:
+    """Return the absolute path of the state file (env var override or default)."""
+    if SYNC_STATE_FILE:
+        return os.path.abspath(SYNC_STATE_FILE)
+    return _default_state_file_path()
+
+
+def load_state() -> Dict[str, str]:
+    """Load the ``path → guid`` mapping from disk.
+
+    Returns an empty dict if the file is missing or unreadable.  Logs a warning
+    and returns an empty dict on JSON corruption / unexpected schema rather
+    than raising, so the sync can rebuild the mapping via the
+    ``(name, category)`` + description-stamp fallbacks.
+    """
+    path = _state_file_path()
+    if not os.path.isfile(path):
+        return {}
+
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        log.warning(
+            "Could not read sync state file %s (%s) – rebuilding mapping from "
+            "TRMM script descriptions and (name, category) fallbacks.",
+            path,
+            exc,
+        )
+        return {}
+
+    if not isinstance(raw, dict) or not isinstance(raw.get("paths"), dict):
+        log.warning(
+            "Sync state file %s has unexpected schema – rebuilding mapping.",
+            path,
+        )
+        return {}
+
+    paths_obj = raw["paths"]
+    mapping: Dict[str, str] = {}
+    seen_guids: Set[str] = set()
+    duplicate_guids: Set[str] = set()
+
+    for rel_path, guid in paths_obj.items():
+        if not isinstance(rel_path, str) or not isinstance(guid, str) or not guid:
+            continue
+        if guid in seen_guids:
+            duplicate_guids.add(guid)
+            continue
+        seen_guids.add(guid)
+        mapping[rel_path] = guid
+
+    if duplicate_guids:
+        # Drop every entry tied to a duplicated guid so the matching logic
+        # safely falls back to (name, category) adoption for those scripts.
+        log.warning(
+            "Sync state file contained %d duplicated guid(s); dropping affected "
+            "entries and falling back to (name, category) matching.",
+            len(duplicate_guids),
+        )
+        mapping = {
+            p: g for p, g in mapping.items() if g not in duplicate_guids
+        }
+
+    return mapping
+
+
+def save_state(state: Dict[str, str]) -> None:
+    """Write *state* atomically to the configured state file."""
+    path = _state_file_path()
+    parent = os.path.dirname(path) or "."
+    try:
+        os.makedirs(parent, exist_ok=True)
+    except OSError as exc:
+        log.warning("Could not create directory for state file %s: %s", path, exc)
+        return
+
+    payload = {"version": STATE_FILE_VERSION, "paths": state}
+    try:
+        # Write to a sibling temp file then os.replace for atomicity.
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=".trmm_sync_state.", suffix=".tmp", dir=parent
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2, sort_keys=True)
+                fh.write("\n")
+            os.replace(tmp_path, path)
+        except Exception:
+            # Best-effort cleanup of the temp file on failure.
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+    except OSError as exc:
+        log.warning("Could not write state file %s: %s", path, exc)
+
+
+# ---------------------------------------------------------------------------
 # Git / local-clone helpers
 # ---------------------------------------------------------------------------
 
@@ -140,7 +266,7 @@ def _git_run(args: List[str], cwd: Optional[str] = None) -> subprocess.Completed
     return result
 
 
-def _ensure_local_repo() -> Tuple[bool, List[str], List[str]]:
+def _ensure_local_repo() -> Tuple[bool, List[str], List[str], List[Tuple[str, str]]]:
     """Ensure a local clone of the Gitea repo exists at ``GITEA_LOCAL_PATH``.
 
     * On the first run (or when the directory is not a git repository) the repo
@@ -149,14 +275,19 @@ def _ensure_local_repo() -> Tuple[bool, List[str], List[str]]:
       between the previous HEAD and the new HEAD are recorded.
 
     Returns:
-        (is_fresh_clone, modified_paths, deleted_paths)
+        (is_fresh_clone, modified_paths, deleted_paths, rename_pairs)
 
     ``is_fresh_clone`` is ``True`` when the repo was just cloned for the first
-    time; in that case ``modified_paths`` and ``deleted_paths`` are both empty
-    (the caller should treat every file as new).
+    time; in that case ``modified_paths``, ``deleted_paths`` and
+    ``rename_pairs`` are all empty (the caller should treat every file as new).
 
     ``modified_paths`` and ``deleted_paths`` contain repository-relative POSIX
-    paths (e.g. ``"Checks/Check Disk Space.ps1"``).
+    paths (e.g. ``"Checks/Check Disk Space.ps1"``).  ``rename_pairs`` is a list
+    of ``(old_path, new_path)`` tuples for files that git detected as renames.
+    Renamed files are *not* duplicated in ``modified_paths`` or
+    ``deleted_paths`` – callers must process renames separately so the
+    corresponding TRMM script can be moved/renamed in place rather than
+    deleted-and-recreated (which would lose its preserved settings).
     """
     local_path = os.path.abspath(GITEA_LOCAL_PATH)
 
@@ -181,7 +312,7 @@ def _ensure_local_repo() -> Tuple[bool, List[str], List[str]]:
         clone_url = _build_clone_url()
         _git_run(["clone", "--branch", GITEA_BRANCH, clone_url, local_path])
         log.info("  Clone complete")
-        return True, [], []
+        return True, [], [], []
 
     # Existing clone – pull and collect changed paths.
     old_head = _git_run(["rev-parse", "HEAD"], cwd=local_path).stdout.strip()
@@ -197,17 +328,23 @@ def _ensure_local_repo() -> Tuple[bool, List[str], List[str]]:
 
     if old_head == new_head:
         log.info("  Already up to date (HEAD=%s)", new_head[:8])
-        return False, [], []
+        return False, [], [], []
 
     log.info("  Updated %s → %s", old_head[:8], new_head[:8])
 
+    # ``-M50%`` lowers the rename-detection similarity threshold from git's
+    # default (50%) but states it explicitly so that a future change to the
+    # default does not silently regress rename handling.  Files that are both
+    # renamed *and* modified are still detected as renames as long as at least
+    # half their content survives.
     diff_output = _git_run(
-        ["diff", "--name-status", old_head, new_head],
+        ["diff", "--name-status", "-M50%", old_head, new_head],
         cwd=local_path,
     ).stdout.strip()
 
     modified_paths: List[str] = []
     deleted_paths: List[str] = []
+    rename_pairs: List[Tuple[str, str]] = []
 
     for line in diff_output.splitlines():
         if not line:
@@ -217,8 +354,7 @@ def _ensure_local_repo() -> Tuple[bool, List[str], List[str]]:
         if status.startswith("R"):
             # Rename: R<score>\t<old_path>\t<new_path>
             if len(parts) >= 3:
-                deleted_paths.append(parts[1])
-                modified_paths.append(parts[2])
+                rename_pairs.append((parts[1], parts[2]))
         elif status.startswith("C"):
             # Copy: C<score>\t<src_path>\t<dst_path> – only the new file needs syncing
             if len(parts) >= 3:
@@ -230,7 +366,7 @@ def _ensure_local_repo() -> Tuple[bool, List[str], List[str]]:
             if len(parts) >= 2:
                 deleted_paths.append(parts[1])
 
-    return False, modified_paths, deleted_paths
+    return False, modified_paths, deleted_paths, rename_pairs
 
 
 # ---------------------------------------------------------------------------
@@ -245,7 +381,7 @@ def _shell_from_filename(filename: str) -> Optional[str]:
 
 
 def _append_local_script(
-    scripts: List[dict], file_path: str, category: str
+    scripts: List[dict], file_path: str, category: str, rel_path: str
 ) -> None:
     """Read *file_path* from disk and append a script entry to *scripts*."""
     filename = os.path.basename(file_path)
@@ -277,6 +413,7 @@ def _append_local_script(
             "category": category,
             "shell": shell,
             "content": content,
+            "path": rel_path,
         }
     )
 
@@ -341,13 +478,13 @@ def collect_local_scripts(filter_paths: Optional[Set[str]] = None) -> List[dict]
                 rel_path = f"{category}/{file_entry.name}"
                 if filter_paths is not None and rel_path not in filter_paths:
                     continue
-                _append_local_script(scripts, file_entry.path, category)
+                _append_local_script(scripts, file_entry.path, category, rel_path)
 
         elif entry.is_file(follow_symlinks=False):
             rel_path = entry.name
             if filter_paths is not None and rel_path not in filter_paths:
                 continue
-            _append_local_script(scripts, entry.path, "")
+            _append_local_script(scripts, entry.path, "", rel_path)
 
     return scripts
 
@@ -455,38 +592,144 @@ def get_all_trmm_scripts() -> Dict[Tuple[str, str], dict]:
 
 GITEA_DESCRIPTION_PREFIX: str = "[Gitea]"
 
+# Matches both the legacy ``[Gitea]`` prefix and the guid-stamped
+# ``[Gitea:<guid>]`` prefix at the start of a description.  Used to identify
+# scripts that were created/managed by this sync tool, and to recover the
+# associated TRMM guid when the JSON state file is missing or stale.
+GITEA_DESCRIPTION_RE: "re.Pattern[str]" = re.compile(
+    r"^\[Gitea(?::(?P<guid>[^\]]+))?\]"
+)
 
-def _gitea_description(existing_description: str) -> str:
+
+def _is_gitea_managed(description: Optional[str]) -> bool:
+    """Return True if *description* indicates a Gitea-managed script."""
+    if not description:
+        return False
+    return bool(GITEA_DESCRIPTION_RE.match(description))
+
+
+def _guid_from_description(description: Optional[str]) -> Optional[str]:
+    """Return the embedded TRMM guid from a ``[Gitea:<guid>]`` prefix, if any."""
+    if not description:
+        return None
+    match = GITEA_DESCRIPTION_RE.match(description)
+    if not match:
+        return None
+    return match.group("guid")
+
+
+def _gitea_description(existing_description: str, guid: Optional[str] = None) -> str:
     """
-    Return *existing_description* with ``[Gitea]`` prepended.
+    Return *existing_description* with the ``[Gitea]`` (or ``[Gitea:<guid>]``)
+    prefix applied.
 
-    Idempotent – if the prefix is already present it is not added again,
-    so repeated sync runs do not accumulate multiple prefixes.
+    Idempotent – any existing ``[Gitea]`` / ``[Gitea:<old-guid>]`` prefix is
+    replaced rather than accumulated, so repeated sync runs do not produce
+    multiple prefixes.  When *guid* is provided, the guid-stamped form is used
+    as a belt-and-braces backup that lets the mapping be rebuilt if the JSON
+    state file is lost.
     """
     description = existing_description or ""
-    if description.startswith(GITEA_DESCRIPTION_PREFIX):
-        return description
+    new_prefix = (
+        f"[Gitea:{guid}]" if guid else GITEA_DESCRIPTION_PREFIX
+    )
+
+    match = GITEA_DESCRIPTION_RE.match(description)
+    if match:
+        # Strip the existing prefix (and any single space following it) so we
+        # can replace it with the new one without doubling up.
+        remainder = description[match.end():]
+        if remainder.startswith(" "):
+            remainder = remainder[1:]
+        if remainder:
+            return f"{new_prefix} {remainder}"
+        return new_prefix
+
     if description:
-        return f"{GITEA_DESCRIPTION_PREFIX} {description}"
-    return GITEA_DESCRIPTION_PREFIX
+        return f"{new_prefix} {description}"
+    return new_prefix
 
 
-def sync_script(gitea_script: dict, trmm_index: Dict[Tuple[str, str], dict]) -> str:
+def _build_guid_index(
+    trmm_index: Dict[Tuple[str, str], dict],
+) -> Dict[str, Tuple[Tuple[str, str], dict]]:
+    """Return ``guid → ((name, category), script)`` for every script that has a guid."""
+    result: Dict[str, Tuple[Tuple[str, str], dict]] = {}
+    for key, script in trmm_index.items():
+        guid = script.get("guid")
+        if guid:
+            result[guid] = (key, script)
+    return result
+
+
+def _resolve_existing_script(
+    rel_path: str,
+    name: str,
+    category: str,
+    state: Dict[str, str],
+    trmm_index: Dict[Tuple[str, str], dict],
+    guid_index: Dict[str, Tuple[Tuple[str, str], dict]],
+) -> Tuple[Optional[Tuple[str, str]], Optional[dict]]:
+    """Find an existing TRMM script that matches *rel_path*.
+
+    Resolution order:
+      1. State file: ``rel_path → guid`` → guid index.
+      2. ``(name, category)`` lookup against TRMM (adoption of pre-existing
+         scripts that have not yet been bound to a guid in the state file).
+      3. Description-stamp recovery: any TRMM script whose description carries
+         a ``[Gitea:<guid>]`` prefix matching the state mapping.
+
+    Returns ``(key, script)`` where ``key`` is the script's current
+    ``(name, category)`` in TRMM, or ``(None, None)`` if no match was found.
+    """
+    # 1. State-file lookup.
+    guid = state.get(rel_path)
+    if guid and guid in guid_index:
+        return guid_index[guid]
+
+    # 2. (name, category) fallback.
+    key: Tuple[str, str] = (name, category)
+    if key in trmm_index:
+        return key, trmm_index[key]
+
+    # 3. Description-stamp recovery (only useful when the state file is gone
+    # but TRMM still carries the [Gitea:<guid>] prefix from a prior run).
+    if guid:
+        for trmm_key, script in trmm_index.items():
+            if _guid_from_description(script.get("description")) == guid:
+                return trmm_key, script
+
+    return None, None
+
+
+def sync_script(
+    gitea_script: dict,
+    trmm_index: Dict[Tuple[str, str], dict],
+    guid_index: Dict[str, Tuple[Tuple[str, str], dict]],
+    state: Dict[str, str],
+) -> str:
     """
     Create or update a single TRMM script from *gitea_script*.
 
     Returns ``"created"``, ``"updated"``, ``"skipped"``, or raises on error.
-    Scripts that already exist in TRMM with identical content are skipped so
-    that only genuine changes result in API write calls.
+
+    Matching is guid-first (via *state*) with a ``(name, category)`` fallback
+    so that pre-existing TRMM scripts are adopted on first sync.  When a match
+    is found the existing TRMM record is updated in place – including its
+    ``name`` and ``category`` – so renames/moves in Gitea propagate without
+    losing the TRMM script ``id`` or any TRMM-managed settings.
     """
     name: str = gitea_script["name"]
     category: str = gitea_script["category"]
     shell: str = gitea_script["shell"]
     content: str = gitea_script["content"]
-    key: Tuple[str, str] = (name, category)
+    rel_path: str = gitea_script["path"]
 
-    if key in trmm_index:
-        existing = trmm_index[key]
+    existing_key, existing = _resolve_existing_script(
+        rel_path, name, category, state, trmm_index, guid_index
+    )
+
+    if existing is not None and existing_key is not None:
         script_id: int = existing["id"]
 
         # The TRMM list endpoint (/scripts/) omits script_body for performance.
@@ -494,20 +737,37 @@ def sync_script(gitea_script: dict, trmm_index: Dict[Tuple[str, str], dict]) -> 
         # update the cache so any subsequent reference to this entry is complete.
         if "script_body" not in existing:
             existing = get_trmm_script_detail(script_id)
-            trmm_index[key] = existing
+            trmm_index[existing_key] = existing
+            guid = existing.get("guid")
+            if guid:
+                guid_index[guid] = (existing_key, existing)
+
+        guid = existing.get("guid")
         existing_body: str = existing.get("script_body") or ""
         existing_description: str = existing.get("description") or ""
-        new_description: str = _gitea_description(existing_description)
+        new_description: str = _gitea_description(existing_description, guid)
+        existing_name: str = existing.get("name") or ""
+        existing_category: str = existing.get("category") or ""
 
-        # Skip the PUT when the script body and description prefix are both
-        # already up-to-date, avoiding unnecessary writes to TRMM.
-        if existing_body == content and existing_description == new_description:
+        # Record the binding in the state file even when no API write is needed
+        # so first-time adoption persists across runs.
+        if guid:
+            state[rel_path] = guid
+
+        # Skip the PUT when every Gitea-controlled field is already up-to-date,
+        # avoiding unnecessary writes to TRMM.
+        if (
+            existing_body == content
+            and existing_description == new_description
+            and existing_name == name
+            and existing_category == category
+        ):
             log.debug("Skipped  : %s [category=%s] (no changes)", name, category)
             return "skipped"
 
         # Preserve every TRMM-managed field; only replace the script body
-        # (and keep name/category/shell consistent with Gitea).
-        # Description is updated to carry the [Gitea] prefix.
+        # (and keep name/category/shell consistent with Gitea).  Description
+        # is updated to carry the [Gitea] / [Gitea:<guid>] prefix.
         payload = {
             "name": name,
             "script_body": content,
@@ -525,7 +785,34 @@ def sync_script(gitea_script: dict, trmm_index: Dict[Tuple[str, str], dict]) -> 
             "env_vars": existing.get("env_vars") or [],
         }
         _trmm_put(f"/scripts/{script_id}/", payload)
-        log.info("Updated  : %s [category=%s]", name, category)
+
+        # Keep the in-memory indexes consistent with the new name/category so
+        # that subsequent lookups in the same run see the moved entry.
+        if existing_key != (name, category):
+            trmm_index.pop(existing_key, None)
+        existing.update(
+            {
+                "name": name,
+                "category": category,
+                "script_body": content,
+                "description": new_description,
+                "shell": shell,
+            }
+        )
+        trmm_index[(name, category)] = existing
+        if guid:
+            guid_index[guid] = ((name, category), existing)
+
+        if existing_name != name or existing_category != category:
+            log.info(
+                "Renamed  : %s [category=%s] → %s [category=%s]",
+                existing_name,
+                existing_category,
+                name,
+                category,
+            )
+        else:
+            log.info("Updated  : %s [category=%s]", name, category)
         return "updated"
 
     # Script does not exist in TRMM yet – create it with sensible defaults.
@@ -544,7 +831,52 @@ def sync_script(gitea_script: dict, trmm_index: Dict[Tuple[str, str], dict]) -> 
         "run_as_user": False,
         "env_vars": [],
     }
-    _trmm_post("/scripts/", payload)
+    resp = _trmm_post("/scripts/", payload)
+
+    # Record the new script in the state file (and index) using the guid TRMM
+    # assigned.  The POST response shape varies between TRMM versions, so we
+    # fall back to a /scripts/ refresh if the guid is missing.
+    new_guid: Optional[str] = None
+    try:
+        body = resp.json()
+        if isinstance(body, dict):
+            new_guid = body.get("guid")
+            new_id = body.get("id")
+            if new_guid and new_id:
+                # Re-stamp the description with the guid so a future state-file
+                # loss can still rebuild the mapping.
+                stamped_description = _gitea_description("", new_guid)
+                try:
+                    _trmm_put(
+                        f"/scripts/{new_id}/",
+                        {**payload, "description": stamped_description},
+                    )
+                except requests.HTTPError as exc:
+                    log.debug(
+                        "Could not stamp guid into description for new script "
+                        "'%s' [%s]: %s",
+                        name,
+                        category,
+                        exc,
+                    )
+    except (ValueError, requests.exceptions.JSONDecodeError):
+        pass
+
+    if not new_guid:
+        # Fall back to looking the script up by (name, category) – this costs
+        # one extra API call but only in the rare case where the POST response
+        # did not include the guid.
+        try:
+            refreshed = get_all_trmm_scripts()
+            entry = refreshed.get((name, category))
+            if entry:
+                new_guid = entry.get("guid")
+        except (requests.exceptions.RequestException, RuntimeError):
+            pass
+
+    if new_guid:
+        state[rel_path] = new_guid
+
     log.info("Created  : %s [category=%s]", name, category)
     return "created"
 
@@ -604,7 +936,7 @@ def main() -> None:
     # Step 1 – Ensure the local git clone is up to date.
     # ------------------------------------------------------------------
     try:
-        is_fresh_clone, modified_paths, deleted_paths = _ensure_local_repo()
+        is_fresh_clone, modified_paths, deleted_paths, rename_pairs = _ensure_local_repo()
     except Exception as exc:  # pylint: disable=broad-except
         log.error("Failed to prepare local Gitea repo: %s", exc)
         sys.exit(1)
@@ -615,13 +947,26 @@ def main() -> None:
     #  * Incremental otherwise (only process files that changed).
     is_full_sync: bool = FULL_SYNC or is_fresh_clone
 
-    if not is_full_sync and not modified_paths and not deleted_paths:
+    if (
+        not is_full_sync
+        and not modified_paths
+        and not deleted_paths
+        and not rename_pairs
+    ):
         log.info("No changes detected in Gitea repo – nothing to sync")
         return
 
     # ------------------------------------------------------------------
-    # Step 2 – Fetch the current TRMM script index.
+    # Step 2 – Load persistent path → guid state and fetch TRMM scripts.
     # ------------------------------------------------------------------
+    state: Dict[str, str] = load_state()
+    if state:
+        log.info(
+            "Loaded %d path → guid mapping(s) from %s",
+            len(state),
+            _state_file_path(),
+        )
+
     log.info("Fetching scripts from TRMM …")
     try:
         trmm_index = get_all_trmm_scripts()
@@ -629,9 +974,104 @@ def main() -> None:
         log.error("Failed to fetch scripts from TRMM: %s", exc)
         sys.exit(1)
     log.info("  %d script(s) found in TRMM", len(trmm_index))
+    guid_index = _build_guid_index(trmm_index)
 
     # ------------------------------------------------------------------
-    # Step 3 – Collect scripts from the local clone.
+    # Step 3 – Apply git-detected renames first so the (name, category)
+    # map in TRMM is up to date before any add/modify processing happens.
+    # Renames preserve the TRMM script id and all TRMM-managed settings;
+    # the rename pair's old path is removed from the state file and the
+    # new path is bound to the same guid.
+    # ------------------------------------------------------------------
+    created = updated = skipped = deleted = renamed = errors = 0
+    processed_paths: Set[str] = set()
+
+    for old_path, new_path in rename_pairs:
+        # Skip rename pairs whose new path is not a supported script (e.g.
+        # README.md → CHANGELOG.md) – nothing to do in TRMM either way.
+        new_parsed = _parse_script_path(new_path)
+        old_parsed = _parse_script_path(old_path)
+
+        if new_parsed is None and old_parsed is None:
+            continue
+
+        # If the *new* path is not a recognised script, treat the rename as a
+        # delete of the old path so its TRMM counterpart is removed.
+        if new_parsed is None:
+            deleted_paths.append(old_path)
+            continue
+
+        # If the *old* path was not a recognised script, treat the rename as
+        # an add of the new path; sync_script will create or adopt as needed.
+        if old_parsed is None:
+            modified_paths.append(new_path)
+            continue
+
+        # Real rename: collect the new file from disk and let sync_script
+        # update the existing TRMM record in place.
+        try:
+            collected = collect_local_scripts(filter_paths={new_path})
+        except OSError as exc:
+            log.error("Failed to read renamed file %s: %s", new_path, exc)
+            errors += 1
+            continue
+
+        if not collected:
+            # File missing on disk for some reason – fall back to delete
+            # of the old TRMM record so we don't leave a stale script.
+            log.warning(
+                "Renamed file %s could not be read – treating as a delete of %s",
+                new_path,
+                old_path,
+            )
+            deleted_paths.append(old_path)
+            continue
+
+        # Carry the previous binding forward so sync_script can find the
+        # existing TRMM script via the state mapping.
+        if old_path in state and new_path not in state:
+            state[new_path] = state.pop(old_path)
+        else:
+            state.pop(old_path, None)
+
+        gs = collected[0]
+        try:
+            result = sync_script(gs, trmm_index, guid_index, state)
+            processed_paths.add(new_path)
+            if result == "created":
+                created += 1
+            elif result == "skipped":
+                skipped += 1
+            else:
+                # sync_script logs "Renamed" vs "Updated" appropriately.
+                if (gs["name"], gs["category"]) != (
+                    old_parsed[0],
+                    old_parsed[1],
+                ):
+                    renamed += 1
+                else:
+                    updated += 1
+        except requests.HTTPError as exc:
+            response_detail = ""
+            if exc.response is not None:
+                try:
+                    response_detail = f"  Response body: {exc.response.text}"
+                except Exception:  # pylint: disable=broad-except
+                    pass
+            log.error(
+                "HTTP error renaming '%s' → '%s': %s%s",
+                old_path,
+                new_path,
+                exc,
+                response_detail,
+            )
+            errors += 1
+        except Exception as exc:  # pylint: disable=broad-except
+            log.error("Unexpected error renaming '%s' → '%s': %s", old_path, new_path, exc)
+            errors += 1
+
+    # ------------------------------------------------------------------
+    # Step 4 – Collect scripts from the local clone (full or incremental).
     # ------------------------------------------------------------------
     if is_full_sync:
         log.info("Collecting all scripts from local Gitea clone …")
@@ -654,13 +1094,14 @@ def main() -> None:
     log.info("  %d script(s) to process", len(gitea_scripts))
 
     # ------------------------------------------------------------------
-    # Step 4 – Create / update scripts in TRMM.
+    # Step 5 – Create / update scripts in TRMM.
     # ------------------------------------------------------------------
-    created = updated = skipped = errors = 0
-
     for gs in gitea_scripts:
+        if gs["path"] in processed_paths:
+            # Already handled as part of a rename pair above.
+            continue
         try:
-            result = sync_script(gs, trmm_index)
+            result = sync_script(gs, trmm_index, guid_index, state)
             if result == "created":
                 created += 1
             elif result == "skipped":
@@ -692,19 +1133,25 @@ def main() -> None:
             errors += 1
 
     # ------------------------------------------------------------------
-    # Step 5 – Delete TRMM scripts that were removed from Gitea.
+    # Step 6 – Delete TRMM scripts that were removed from Gitea.
     # ------------------------------------------------------------------
-    deleted = 0
-
     if is_full_sync:
         # Full sync: remove any TRMM script (with the [Gitea] prefix) whose
-        # counterpart no longer exists anywhere in the repo.
-        gitea_keys = {(gs["name"], gs["category"]) for gs in gitea_scripts}
-        for key, script in trmm_index.items():
+        # counterpart no longer exists anywhere in the repo.  Match by guid
+        # via the state file as well as by (name, category) so we don't
+        # accidentally delete a script that was just renamed in TRMM by the
+        # current run.
+        gitea_keys: Set[Tuple[str, str]] = {
+            (gs["name"], gs["category"]) for gs in gitea_scripts
+        }
+        gitea_guids: Set[str] = {state[p] for p in state if state.get(p)}
+        for key, script in list(trmm_index.items()):
             description = script.get("description") or ""
-            if not description.startswith(GITEA_DESCRIPTION_PREFIX):
+            if not _is_gitea_managed(description):
                 continue
             if key in gitea_keys:
+                continue
+            if script.get("guid") and script["guid"] in gitea_guids:
                 continue
             script_id = script["id"]
             name, category = key
@@ -712,6 +1159,11 @@ def main() -> None:
                 _trmm_delete(f"/scripts/{script_id}/")
                 log.info("Deleted  : %s [category=%s]", name, category)
                 deleted += 1
+                # Drop any stale state entries that pointed at this guid.
+                guid = script.get("guid")
+                if guid:
+                    for sp in [p for p, g in state.items() if g == guid]:
+                        state.pop(sp, None)
             except requests.HTTPError as exc:
                 log.error(
                     "HTTP error deleting '%s' [%s]: %s",
@@ -732,25 +1184,39 @@ def main() -> None:
         # Incremental sync: only delete TRMM scripts for files that git
         # explicitly reported as deleted in this pull.
         for rel_path in deleted_paths:
-            parsed = _parse_script_path(rel_path)
-            if parsed is None:
-                continue
-            name, category = parsed
-            key = (name, category)
+            # Resolve via state first (handles the case where the TRMM
+            # script was previously renamed in Gitea and the (name, category)
+            # no longer matches the deleted path).
+            guid = state.pop(rel_path, None)
+            target_key: Optional[Tuple[str, str]] = None
+            target_script: Optional[dict] = None
 
-            if key not in trmm_index:
+            if guid and guid in guid_index:
+                target_key, target_script = guid_index[guid]
+            else:
+                parsed = _parse_script_path(rel_path)
+                if parsed is None:
+                    continue
+                name, category = parsed
+                target_key = (name, category)
+                target_script = trmm_index.get(target_key)
+
+            if target_script is None or target_key is None:
                 continue
 
-            script = trmm_index[key]
-            description = script.get("description") or ""
-            if not description.startswith(GITEA_DESCRIPTION_PREFIX):
+            description = target_script.get("description") or ""
+            if not _is_gitea_managed(description):
                 continue
 
-            script_id = script["id"]
+            script_id = target_script["id"]
+            name, category = target_key
             try:
                 _trmm_delete(f"/scripts/{script_id}/")
                 log.info("Deleted  : %s [category=%s]", name, category)
                 deleted += 1
+                trmm_index.pop(target_key, None)
+                if target_script.get("guid"):
+                    guid_index.pop(target_script["guid"], None)
             except requests.HTTPError as exc:
                 log.error(
                     "HTTP error deleting '%s' [%s]: %s",
@@ -768,10 +1234,16 @@ def main() -> None:
                 )
                 errors += 1
 
+    # ------------------------------------------------------------------
+    # Step 7 – Persist the updated path → guid state mapping.
+    # ------------------------------------------------------------------
+    save_state(state)
+
     log.info(
-        "Sync complete – created: %d  updated: %d  skipped: %d  deleted: %d  errors: %d",
+        "Sync complete – created: %d  updated: %d  renamed: %d  skipped: %d  deleted: %d  errors: %d",
         created,
         updated,
+        renamed,
         skipped,
         deleted,
         errors,
