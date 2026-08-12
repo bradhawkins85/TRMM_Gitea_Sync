@@ -934,7 +934,12 @@ def main() -> None:
     github_keys: Set[Tuple[str, str]] = {
         (gs["name"], gs["category"]) for gs in github_scripts
     }
-    github_guids: Set[str] = {state[p] for p in state if state.get(p)}
+    # Only protect scripts whose path is still present in GitHub.  Using all
+    # state entries (including stale paths from removed/renamed files) would
+    # prevent the old TRMM script from ever being deleted when a rename is not
+    # detected (e.g. because the file content also changed, so the blob SHA
+    # differed and the SHA-based heuristic did not fire).
+    github_guids: Set[str] = {state[p] for p in current_paths if state.get(p)}
 
     deleted = 0
     for key, script in list(trmm_index.items()):

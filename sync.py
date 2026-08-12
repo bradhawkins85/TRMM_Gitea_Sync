@@ -1042,6 +1042,18 @@ def main() -> None:
         else:
             state.pop(old_path, None)
 
+        # Fallback: if the state file had no binding for old_path (e.g. first
+        # run after this feature was introduced, or the state file was wiped),
+        # look up the old (name, category) in the TRMM index and pre-bind its
+        # guid so sync_script can locate and rename the script in-place rather
+        # than creating a duplicate.
+        if new_path not in state:
+            old_existing = trmm_index.get((old_parsed[0], old_parsed[1]))
+            if old_existing:
+                old_guid = old_existing.get("guid")
+                if old_guid:
+                    state[new_path] = old_guid
+
         gs = collected[0]
         try:
             result = sync_script(gs, trmm_index, guid_index, state)
