@@ -1164,7 +1164,14 @@ def main() -> None:
         gitea_keys: Set[Tuple[str, str]] = {
             (gs["name"], gs["category"]) for gs in gitea_scripts
         }
-        gitea_guids: Set[str] = {state[p] for p in state if state.get(p)}
+        # Only protect scripts whose path is still present in the Gitea repo.
+        # Using all state entries (including stale paths from removed/renamed
+        # files) would prevent the old TRMM script from ever being deleted when
+        # a rename is not detected (e.g. because the file content changed beyond
+        # git's -M50% similarity threshold, so the diff showed a delete + add
+        # rather than a rename).
+        gitea_current_paths: Set[str] = {gs["path"] for gs in gitea_scripts}
+        gitea_guids: Set[str] = {state[p] for p in gitea_current_paths if state.get(p)}
         for key, script in list(trmm_index.items()):
             description = script.get("description") or ""
             if not _is_gitea_managed(description):
